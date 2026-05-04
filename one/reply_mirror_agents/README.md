@@ -96,7 +96,124 @@ Each split (`The Truman Show - train/`, `The Truman Show - validation/`) contain
 - **Rule-weighted disagreement** – when the agents disagree the deterministic risk score breaks the tie, weighted highest. This protects against a single noisy LLM tipping the verdict.
 - **Economic-impact escalation** – high-value transactions get a small fraud-leaning nudge, mirroring the asymmetric cost in the scoring rules.
 
-## 4. Project layout
+## 4. Per-transaction flow (sequence)
+
+This is what happens for **one** `transaction_id` inside `FraudOrchestrator.run_dataset`. Read top-to-bottom; arrows mean "calls" or "returns".
+
+```
+                       ┌─────────────────────────────────┐
+                       │ main.py --dataset all           │
+                       └────────────────┬────────────────┘
+                                        ▼
+                       ┌─────────────────────────────────┐
+                       │ FraudOrchestrator.run_dataset() │
+                       │   load_dataset(split)           │  ← parses CSV/JSON,
+                       │     → DatasetBundle             │    builds IBAN/biotag
+                       │   tracer.start_run(split)       │    indexes once
+                       └────────────────┬────────────────┘
+                                        │  for each TransactionRecord:
+                                        ▼
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │ ┌────────────────────────────────────────────────────────────────┐   │
+   │ │ PrimaryFraudInvestigator.investigate(transaction_id)           │   │
+   │ │ ──────────────────────────────────────────────────────────     │   │
+   │ │  1. tools.build_transaction_evidence_bundle(txn_id)            │   │
+   │ │       │   (one composite tool that internally calls 5 tools)   │   │
+   │ │       ├─► get_transaction_context()      ← amount/type/IBAN    │   │
+   │ │       ├─► resolve_transaction_parties()  ← sender/recipient    │   │
+   │ │       │                                    user, IBAN cross-   │   │
+   │ │       │                                    check, focal role   │   │
+   │ │       ├─► get_user_location_context()    ← GPS within ±36 h    │   │
+   │ │       │                                    (in-person/withdraw │   │
+   │ │       │                                    only — else "low")  │   │
+   │ │       ├─► get_user_message_context()     ← SMS+mail in last    │   │
+   │ │       │                                    21 d, classify each │   │
+   │ │       │                                    suspicious / legit  │   │
+   │ │       ├─► get_behavior_baseline()        ← per-user history:   │   │
+   │ │       │                                    median, p90, hours, │   │
+   │ │       │                                    methods, routines   │   │
+   │ │       └─► score_rule_based_risk()        ← deterministic       │   │
+   │ │                                            risk_score ∈ [0,1] +│   │
+   │ │                                            economic_high_impact│   │
+   │ │                                            flag                │   │
+   │ │                                                                │   │
+   │ │  2. _serialize_evidence(bundle) → compact dict (no raw files)  │   │
+   │ │                                                                │   │
+   │ │  3. LLMClient.invoke_primary(                                  │   │
+   │ │         system=PRIMARY_SYSTEM_PROMPT,                          │   │
+   │ │         user=build_primary_prompt(payload),                    │   │
+   │ │         model="nvidia/nemotron-3-super-120b-a12b:free",        │   │
+   │ │         T=0)                                                   │   │
+   │ │     → raw JSON string                                          │   │
+   │ │                                                                │   │
+   │ │  4. extract_json_payload() + AgentDecision.model_validate()    │   │
+   │ │     fallback ladder if parse fails:                            │   │
+   │ │       a. _recover_from_freeform_text()  (regex extract)        │   │
+   │ │       b. _fallback_decision()  (use risk_score directly)       │   │
+   │ │                                                                │   │
+   │ │  RETURNS: (EvidenceBundle, AgentDecision_primary)              │   │
+   │ └────────────────────────┬───────────────────────────────────────┘   │
+   │                          ▼                                           │
+   │ ┌────────────────────────────────────────────────────────────────┐   │
+   │ │ Orchestrator._should_review(decision, risk, econ_impact)       │   │
+   │ │   trigger reviewer if ANY of:                                  │   │
+   │ │     • primary.confidence  < 0.75                               │   │
+   │ │     • econ_impact AND primary.p(fraud) ≥ 0.45                  │   │
+   │ │     • risk_score ≥ 0.75 AND primary.confidence < 0.90          │   │
+   │ └────────────────────────┬───────────────────────────────────────┘   │
+   │                ┌─────────┴────────┐                                  │
+   │              NO│                  │YES (typically ~30–40 % of txns)  │
+   │                │                  ▼                                  │
+   │                │  ┌─────────────────────────────────────────────┐    │
+   │                │  │ ReviewerAgent.review(evidence_payload,      │    │
+   │                │  │                       primary_decision)     │    │
+   │                │  │   LLMClient.invoke_reviewer(                │    │
+   │                │  │     system=REVIEWER_SYSTEM_PROMPT,          │    │
+   │                │  │     user=build_reviewer_prompt(             │    │
+   │                │  │       evidence, primary_decision),          │    │
+   │                │  │     model="google/gemma-4-31b-it:free",     │    │
+   │                │  │     T=0)                                    │    │
+   │                │  │   → raw JSON → AgentDecision_reviewer       │    │
+   │                │  │   (same fallback ladder as primary)         │    │
+   │                │  └────────────────┬────────────────────────────┘    │
+   │                │                   │                                 │
+   │                ▼                   ▼                                 │
+   │ ┌────────────────────────────────────────────────────────────────┐   │
+   │ │ Orchestrator._combine(primary, reviewer, risk, econ_impact)    │   │
+   │ │   reviewer is None  → primary.decision (policy: high_conf)     │   │
+   │ │   agree             → primary.decision (policy: agreed)        │   │
+   │ │   disagree:                                                    │   │
+   │ │     blended = 0.45·risk_score                                  │   │
+   │ │             + 0.35·primary.p(fraud)                            │   │
+   │ │             + 0.20·reviewer.p(fraud)                           │   │
+   │ │     if econ_impact and blended ≥ 0.57: blended += 0.05         │   │
+   │ │     fraud iff blended ≥ DISAGREEMENT_THRESHOLD (0.62)          │   │
+   │ │   policy string recorded in predictions CSV                    │   │
+   │ └────────────────────────┬───────────────────────────────────────┘   │
+   │                          ▼                                           │
+   │            tracer.event("transaction_finalized", …)                  │
+   │            if final == "fraud": fraud_ids.append(txn_id)             │
+   │            predictions.append(PredictionRecord(...))                 │
+   └──────────────────────────────────────────────────────────────────────┘
+                                        │  end of for-loop
+                                        ▼
+            write_output_txt(output/<split>_output.txt, fraud_ids)
+            write_predictions_csv(output/predictions_<split>.csv, …)
+            write_langfuse_sessions(output/langfuse_sessions.json, …)
+            create_source_archive(output/reply_mirror_agents_source.zip)
+```
+
+### Quick reference — when does the second LLM run?
+
+| Primary state | Risk score | Economic impact | Reviewer triggered? |
+|---|---|---|---|
+| confidence ≥ 0.90 | any | any | no (high_confidence) |
+| confidence ≥ 0.75 | < 0.75 | not high-impact | no |
+| confidence ≥ 0.75 | < 0.75 | high-impact, p(fraud) ≥ 0.45 | **yes** (high_value_review) |
+| confidence ≥ 0.75, < 0.90 | ≥ 0.75 | any | **yes** (high_risk_check) |
+| confidence < 0.75 | any | any | **yes** (low_confidence) |
+
+## 5. Project layout
 
 ```
 reply_mirror_agents/
@@ -118,7 +235,7 @@ reply_mirror_agents/
 └── notes/linking_logic.md   Discovered schema relationships
 ```
 
-## 5. Setup & run
+## 6. Setup & run
 
 ```powershell
 cd "C:\hackathon reply\one\reply_mirror_agents"
@@ -137,13 +254,13 @@ cd "C:\hackathon reply\one\reply_mirror_agents"
 
 Optional overrides: `PRIMARY_MODEL`, `REVIEWER_MODEL`, `REVIEW_THRESHOLD`, `HIGH_VALUE_REVIEW_PROBABILITY`, `DISAGREEMENT_THRESHOLD`, `LOCATION_WINDOW_HOURS`, `MESSAGE_LOOKBACK_DAYS`, `AMOUNT_HIGH_IMPACT_FLOOR`, `AMOUNT_HIGH_IMPACT_MONTHLY_SALARY_FACTOR`.
 
-## 6. Output
+## 7. Output
 
 - `output/<split>_output.txt` – newline-separated fraud `transaction_id`s (the official deliverable).
 - `output/predictions_<split>.csv` – per-transaction audit: amount, both agent verdicts/confidences, tie-break policy, risk score, reasons.
 - `output/langfuse_sessions.json` – Langfuse trace IDs/URLs for the run.
 - `output/reply_mirror_agents_source.zip` – source archive (auto-emitted for submission).
 
-## 7. Langfuse tracing
+## 8. Langfuse tracing
 
 Each split run becomes one Langfuse trace with nested spans: per-tool calls (`get_transaction_context`, `resolve_transaction_parties`, …), per-agent generations, and a final `transaction_finalized` event with the verdict. Session id format: `{TEAM_NAME}-{ulid}`.

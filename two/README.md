@@ -86,7 +86,147 @@ Each split (`train_data/`, `validation_data/`) contains:
 - **Two heterogeneous Groq models** – Llama-4 and Qwen3 disagree on different cases; using both gives orthogonal signal.
 - **Conservative-on-tie** – when both agents have similar confidence and disagree, low-value cases default to `not_fraud` (cheap to be wrong) and high-value cases default to `fraud` (expensive to miss). Mirrors the asymmetric cost in the scoring rules.
 
-## 4. Project layout
+## 4. Per-transaction flow (sequence)
+
+Variant 2 splits the work into **two phases**: preprocessing builds and persists evidence to disk; the orchestrator then makes decisions from that JSONL. Read top-to-bottom.
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│ PHASE 1 — preprocess_split(split, config)   (runs once per split)         │
+└───────────────────────────────────────────────────────────────────────────┘
+
+   load_dataset(split_dir)  →  Dataset(transactions, users, locations, sms, mails)
+                               │
+                               ▼
+   DataLinker(dataset)  →  builds in-memory indexes:
+                              • iban_to_user
+                              • biotag_to_user (city-prefix + last-name match)
+                              • location_index_by_biotag
+                              • sms / mail indexes by user firstname
+                               │
+                               ▼
+   for each Transaction:
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ build_evidence_bundle(txn_id, linker, config)                   │
+   │ ─────────────────────────────────────────────────────────────── │
+   │  1. tools.get_transaction_context(txn)        — amount/IBAN/ts  │
+   │  2. tools.resolve_transaction_parties(txn)    — IBAN cross-     │
+   │                                                  check, focal   │
+   │                                                  user/role      │
+   │  3. linker.resolve_sender_user(txn)           — User|None       │
+   │  4. tools.get_location_context(txn, sender,                     │
+   │                  window_hours=24)             — GPS plausibility│
+   │  5. tools.get_message_context(sender, txn,                      │
+   │                  lookback_days=7)             — sms+mail counts │
+   │                                                  near the txn   │
+   │                                                  + classify     │
+   │  6. tools.get_behavior_baseline(sender_id, txn) — history avg/  │
+   │                                                    max/methods/ │
+   │                                                    new_recipient│
+   │  7. rules.score_rule_based_risk(evidence)     — weighted multi- │
+   │                                                  signal:        │
+   │                                                  risk_score,    │
+   │                                                  fraud_signals, │
+   │                                                  legitimacy,    │
+   │                                                  uncertainties, │
+   │                                                  econ_high_impact│
+   │  → evidence dict (one per transaction)                          │
+   └─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+   save_evidence(list, evidence/<split>/evidence.jsonl)
+
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│ PHASE 2 — Orchestrator.run_split(split)                                   │
+└───────────────────────────────────────────────────────────────────────────┘
+
+   load_evidence(evidence/<split>/evidence.jsonl)
+                               │  for each evidence dict (1 txn each):
+                               ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ PrimaryAgent.investigate(evidence)                              │
+   │ ─────────────────────────────────────────────────────────────── │
+   │   user_prompt = build_primary_prompt(evidence)                  │
+   │   LLMClient.invoke_primary(                                     │
+   │      system=PRIMARY_SYSTEM_PROMPT,                              │
+   │      user=user_prompt,                                          │
+   │      model="meta-llama/llama-4-scout-17b-16e-instruct",         │
+   │      T=0, max_tokens=700)                                       │
+   │     → raw response                                              │
+   │                                                                 │
+   │   parse path:                                                   │
+   │     extract_json_payload() → _validate_decision()               │
+   │       · decision ∈ {fraud, not_fraud}                           │
+   │       · confidence ∈ [0, 1]                                     │
+   │       · evidence_for_fraud / against_fraud / uncertainties      │
+   │       · fraud_value_sensitivity                                 │
+   │   fallback ladder:                                              │
+   │     a. _recover_from_text(...)  (regex on freeform text)        │
+   │     b. _fallback_decision(...)  (use rule_based_risk_score)     │
+   │   RETURNS primary_decision dict                                 │
+   └────────────────────────┬────────────────────────────────────────┘
+                            ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Orchestrator.should_review(primary_decision)                    │
+   │   trigger reviewer if:                                          │
+   │     • primary.confidence < 0.75                       OR        │
+   │     • fraud_value_sensitivity AND confidence < 0.80             │
+   └────────────────────────┬────────────────────────────────────────┘
+                  ┌─────────┴────────┐
+                NO│                  │YES
+                  │                  ▼
+                  │   sleep(0.5 s)  ← inter-agent rate-limit guard
+                  │   ┌─────────────────────────────────────────────┐
+                  │   │ ReviewerAgent.review(evidence,              │
+                  │   │                       primary_decision)     │
+                  │   │   user_prompt = build_reviewer_prompt(      │
+                  │   │       evidence, primary_decision)           │
+                  │   │   LLMClient.invoke_reviewer(                │
+                  │   │      system=REVIEWER_SYSTEM_PROMPT,         │
+                  │   │      user=user_prompt,                      │
+                  │   │      model="qwen/qwen3-32b",                │
+                  │   │      T=0, max_tokens=500)                   │
+                  │   │   → reviewer_decision dict                  │
+                  │   │   (same parse + fallback ladder as primary; │
+                  │   │   reviewer_fallback defers to primary)      │
+                  │   └────────────────┬────────────────────────────┘
+                  │                    │
+                  ▼                    ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Orchestrator.make_final_decision(primary, reviewer)             │
+   │   reviewer is None      → primary.decision (reviewed=False)     │
+   │   p.decision == r.decision → that decision, conf = max(p,r)     │
+   │   disagree:                                                     │
+   │     |conf gap| > 0.10        → higher-confidence agent wins     │
+   │     conf gap ≤ 0.10 (tie):                                      │
+   │       any high-value flag    → fraud (max conf)                 │
+   │       neither high-value     → not_fraud (max conf · 0.9)       │
+   └────────────────────────┬────────────────────────────────────────┘
+                            ▼
+                  sleep(0.5 s)  ← inter-txn rate-limit guard
+                  if final == "fraud": fraud_ids.append(txn_id)
+                  results.append({primary, reviewer, final, audit…})
+
+                            │  end of for-loop
+                            ▼
+            write_output_txt(output/<split>_output.txt)
+            write_predictions_csv(output/<split>_predictions.csv)
+            write_full_audit(output/<split>_audit.json)
+```
+
+### Quick reference — when does the second LLM run?
+
+| Primary confidence | `fraud_value_sensitivity` flag | Reviewer triggered? |
+|---|---|---|
+| ≥ 0.80 | any | no |
+| ≥ 0.75, < 0.80 | not high-value | no |
+| ≥ 0.75, < 0.80 | high-value | **yes** |
+| < 0.75 | any | **yes** |
+
+Failure handling: if either LLM call returns empty, raises, or yields unparseable JSON, the agent first tries `_recover_from_text` (regex on the freeform output), then `_fallback_decision` which derives a verdict directly from `rule_based_risk.risk_score`. The pipeline never crashes on a bad LLM response.
+
+## 5. Project layout
 
 ```
 two/
@@ -108,7 +248,7 @@ two/
     └── utils.py              shared helpers
 ```
 
-## 5. Setup & run
+## 6. Setup & run
 
 ```powershell
 cd "C:\hackathon reply\two"
@@ -134,13 +274,13 @@ Tunable defaults live in `fraud_detection/config.py`:
 - `location_window_hours = 24.0`
 - `message_lookback_days = 7`
 
-## 6. Output
+## 7. Output
 
 - `output/<split>_output.txt` – the official deliverable, one fraud `transaction_id` per line.
 - `output/<split>_predictions.csv` – per-txn audit row.
 - `output/<split>_audit.json` – full structured audit including both agents' raw outputs.
 
-## 7. Operational notes
+## 8. Operational notes
 
 - LLM client retries 5× with exponential backoff on 429 (Groq rate limits aggressively on free tier).
 - Inter-transaction sleep of 0.5 s and inter-agent sleep of 0.5 s built into the orchestrator to stay under burst limits.
