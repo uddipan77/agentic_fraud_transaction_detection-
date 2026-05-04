@@ -1,0 +1,49 @@
+# ── Secrets & local environment ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtualenvs ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Reply Mirror challenge data (Reply IP — request from maintainer) ─
+one/The Truman Show - train/
+one/The Truman Show - validation/
+two/train_data/
+two/validation_data/
+three/train_data/
+three/val_data/
+
+# ── Cached evidence / audio transcriptions ───────────────────────────
+two/evidence/
+three/evidence/
+
+# ── Generated outputs (regenerated each run) ─────────────────────────
+one/reply_mirror_agents/output/
+two/output/
+three/output/
+
+# ── Bundled source archives ──────────────────────────────────────────
+*.zip
+
+# ── IDE / OS noise ───────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── Claude Code workspace settings ───────────────────────────────────
+.claude/

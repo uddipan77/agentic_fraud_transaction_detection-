@@ -1,0 +1,8 @@
+pypdf
+python-dotenv
+langchain
+langchain-openai
+langchain-core
+langfuse
+pydantic
+requests

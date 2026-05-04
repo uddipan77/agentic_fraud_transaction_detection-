@@ -1,0 +1,9 @@
+pandas
+numpy
+openai
+langfuse
+langchain-openai
+python-dotenv
+python-ulid
+faster-whisper
+pydub
